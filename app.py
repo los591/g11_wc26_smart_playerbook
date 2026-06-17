@@ -1,7 +1,8 @@
 import json
+import os
 import unicodedata
+from datetime import datetime
 from urllib.parse import quote, unquote
-
 import requests
 import streamlit as st
 
@@ -18,6 +19,8 @@ for key, default in [
     ("selected_group", None),
     ("selected_country", None),
     ("selected_player", 0),
+    ("compare_p1", None),
+    ("compare_p2", None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -134,6 +137,20 @@ POSITION_COLOR = {
     "Goalkeeper": "#F59E0B", "Defender": "#10B981",
     "Midfielder": "#3B82F6", "Forward":  "#EF4444",
 }
+COUNTRY_FLAGS = {
+    "México": "🇲🇽", "Sudáfrica": "🇿🇦", "Corea del Sur": "🇰🇷", "República Checa": "🇨🇿",
+    "Canadá": "🇨🇦", "Bosnia y Herzegovina": "🇧🇦", "Qatar": "🇶🇦", "Suiza": "🇨🇭",
+    "Brasil": "🇧🇷", "Marruecos": "🇲🇦", "Haití": "🇭🇹", "Escocia": "🏴󠁧󠁢󠁳󠁣󠁴󠁿",
+    "Estados Unidos": "🇺🇸", "Paraguay": "🇵🇾", "Australia": "🇦🇺", "Turquía": "🇹🇷",
+    "Alemania": "🇩🇪", "Curazao": "🇨🇼", "Costa de Marfil": "🇨🇮", "Ecuador": "🇪🇨",
+    "Países Bajos": "🇳🇱", "Japón": "🇯🇵", "Suecia": "🇸🇪", "Túnez": "🇹🇳",
+    "Bélgica": "🇧🇪", "Egipto": "🇪🇬", "Irán": "🇮🇷", "Nueva Zelanda": "🇳🇿",
+    "España": "🇪🇸", "Cabo Verde": "🇨🇻", "Arabia Saudita": "🇸🇦", "Uruguay": "🇺🇾",
+    "Francia": "🇫🇷", "Senegal": "🇸🇳", "Irak": "🇮🇶", "Noruega": "🇳🇴",
+    "Argentina": "🇦🇷", "Argelia": "🇩🇿", "Austria": "🇦🇹", "Jordania": "🇯🇴",
+    "Portugal": "🇵🇹", "RD Congo": "🇨🇩", "Uzbekistán": "🇺🇿", "Colombia": "🇨🇴",
+    "Inglaterra": "🏴󠁧󠁢󠁥󠁮󠁧󠁿", "Croacia": "🇭🇷", "Ghana": "🇬🇭", "Panamá": "🇵🇦",
+}
 
 # ── Data ───────────────────────────────────────────────────────────────────────
 EXCLUDED_LEAGUES = {"fifa club world cup", "fifa club world cup - play-in"}
@@ -193,6 +210,19 @@ COUNTRY_DISPLAY = {
     for country, squad in all_players.items() if squad
 }
 
+
+@st.cache_data(ttl=3600)
+def load_fixtures():
+    url = "https://raw.githubusercontent.com/los591/g11-data/main/wc_fixtures.json"
+    try:
+        resp = requests.get(url, headers={"Authorization": f"token {st.secrets['github_token']}"}, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:
+        return []
+
+wc_fixtures = load_fixtures()
+
 # ── Search index ───────────────────────────────────────────────────────────────
 def normalize(s):
     s = unicodedata.normalize("NFD", s or "")
@@ -218,6 +248,102 @@ def build_search_index():
     return index
 
 SEARCH_INDEX = build_search_index()
+
+
+@st.cache_data(ttl=3600)
+def compute_standings():
+    """Derive group standings from wc_match_performances data."""
+    team_stats = {}
+    for country, squad in all_players.items():
+        if not squad:
+            continue
+        tid = squad[0].get("country_id")
+        if tid:
+            team_stats[tid] = {
+                "name":    COUNTRY_DISPLAY.get(country, country),
+                "country": country,
+                "group":   COUNTRY_GROUP.get(country, "?"),
+                "P": 0, "W": 0, "D": 0, "L": 0,
+                "GF": 0, "GA": 0, "GD": 0, "Pts": 0,
+            }
+
+    fixture_goals = {}  # {fixture_id: {team_id: total_goals}}
+    for squad in all_players.values():
+        for player in squad:
+            for perf in player.get("wc_match_performances") or []:
+                fid = perf["fixture_id"]
+                tid = perf["team_id"]
+                goals = (perf.get("goals") or {}).get("total") or 0
+                fixture_goals.setdefault(fid, {}).setdefault(tid, 0)
+                fixture_goals[fid][tid] += goals
+
+    for fid, teams in fixture_goals.items():
+        tids = [t for t in teams if t in team_stats]
+        if len(tids) != 2:
+            continue
+        t1, t2 = tids[0], tids[1]
+        g1, g2 = teams[t1], teams[t2]
+        for tid in (t1, t2):
+            team_stats[tid]["P"] += 1
+        team_stats[t1]["GF"] += g1
+        team_stats[t1]["GA"] += g2
+        team_stats[t2]["GF"] += g2
+        team_stats[t2]["GA"] += g1
+        if g1 > g2:
+            team_stats[t1]["W"] += 1
+            team_stats[t1]["Pts"] += 3
+            team_stats[t2]["L"] += 1
+        elif g2 > g1:
+            team_stats[t2]["W"] += 1
+            team_stats[t2]["Pts"] += 3
+            team_stats[t1]["L"] += 1
+        else:
+            team_stats[t1]["D"] += 1
+            team_stats[t1]["Pts"] += 1
+            team_stats[t2]["D"] += 1
+            team_stats[t2]["Pts"] += 1
+
+    for t in team_stats.values():
+        t["GD"] = t["GF"] - t["GA"]
+    return team_stats
+
+
+@st.cache_data(ttl=3600)
+def build_leaderboard():
+    """Flat list of all players who have appeared in at least one WC match."""
+    rows = []
+    for country, squad in all_players.items():
+        for idx, player in enumerate(squad):
+            agg = player.get("wc_aggregates") or {}
+            appearances = agg.get("appearances") or 0
+            if not appearances:
+                continue
+            games   = agg.get("games") or {}
+            goals_d = agg.get("goals") or {}
+            cards   = agg.get("cards") or {}
+            rating  = games.get("rating")
+            try:
+                rating = float(rating) if rating is not None else None
+            except (TypeError, ValueError):
+                rating = None
+            rows.append({
+                "player":      player["player"],
+                "country":     country,
+                "idx":         idx,
+                "position":    player.get("position", ""),
+                "photo":       (player.get("player_info") or {}).get("photo") or player.get("player_photo", ""),
+                "appearances": appearances,
+                "minutes":     games.get("minutes") or 0,
+                "goals":       goals_d.get("total") or 0,
+                "assists":     goals_d.get("assists") or 0,
+                "saves":       goals_d.get("saves") or 0,
+                "rating":      rating,
+                "yellow":      cards.get("yellow") or 0,
+                "red":         cards.get("red") or 0,
+                "offsides":    agg.get("offsides") or 0,
+            })
+    return rows
+
 
 # ── Stat helpers ───────────────────────────────────────────────────────────────
 def _sum(blocks, *keys):
@@ -408,6 +534,21 @@ def go_player(country, idx):
     st.session_state.selected_country = country
     st.session_state.selected_player = idx
 
+def go_standings():
+    st.session_state.view = "standings"
+    st.session_state.selected_group = st.session_state.selected_country = None
+    st.session_state.selected_player = 0
+
+def go_calendar():
+    st.session_state.view = "calendar"
+    st.session_state.selected_group = st.session_state.selected_country = None
+    st.session_state.selected_player = 0
+
+def go_compare():
+    st.session_state.view = "compare"
+    st.session_state.selected_group = st.session_state.selected_country = None
+    st.session_state.selected_player = 0
+
 # ── Banner ─────────────────────────────────────────────────────────────────────
 def render_banner():
     st.markdown("""
@@ -448,9 +589,571 @@ def render_banner():
     </div>
     """, unsafe_allow_html=True)
 
+# ── Leaderboard row helper ─────────────────────────────────────────────────────
+def _lb_section(rows, stat_key, stat_label, decimals=0, extra_key=None, extra_label=None, top_n=25):
+    filtered = [r for r in rows if (r.get(stat_key) or 0) > 0]
+    if not filtered:
+        st.info("No data yet — check back after matches are played.")
+        return
+    for i, row in enumerate(filtered[:top_n]):
+        photo_col, info_col, stat_col, btn_col = st.columns([0.55, 4.5, 1.2, 1.4])
+        with photo_col:
+            rank_html = f"<div style='font-size:11px;color:#64748B;text-align:center;margin-bottom:2px'>{i + 1}</div>"
+            if row["photo"]:
+                st.markdown(
+                    rank_html +
+                    f"<img src='{row['photo']}' style='width:36px;height:36px;"
+                    "border-radius:6px;object-fit:cover;display:block;margin:0 auto'>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    rank_html +
+                    "<div style='width:36px;height:36px;background:#0F172A;"
+                    "border-radius:6px;display:flex;align-items:center;justify-content:center;"
+                    "font-size:18px;margin:0 auto'>👤</div>",
+                    unsafe_allow_html=True,
+                )
+        with info_col:
+            flag = COUNTRY_FLAGS.get(row["country"], "")
+            country_disp = COUNTRY_DISPLAY.get(row["country"], row["country"])
+            st.markdown(
+                f"**{row['player']}**<br>"
+                f"<span class='info-pill'>{flag} {country_disp}</span> "
+                f"<span class='info-pill'>{row['position']}</span>",
+                unsafe_allow_html=True,
+            )
+        with stat_col:
+            val = row.get(stat_key)
+            disp = (
+                f"{val:.{decimals}f}" if decimals and val is not None
+                else str(int(val)) if val is not None else "—"
+            )
+            extra_html = ""
+            if extra_key:
+                ev = row.get(extra_key) or 0
+                if ev:
+                    extra_html = (
+                        f"<div style='font-size:11px;color:#FCA5A5;margin-top:4px'>"
+                        f"{int(ev)} {extra_label}</div>"
+                    )
+            st.markdown(
+                f"<div class='stat-box'>"
+                f"  <div class='stat-val'>{disp}</div>"
+                f"  <div class='stat-lbl'>{stat_label}</div>"
+                f"  {extra_html}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        with btn_col:
+            if st.button("View →", key=f"lb_{stat_key}_{i}_{row['country']}_{row['idx']}"):
+                go_player(row["country"], row["idx"])
+                st.rerun()
+
+
+# ── VIEW: STANDINGS ────────────────────────────────────────────────────────────
+def render_standings():
+    render_banner()
+
+    back_col, _ = st.columns([1, 9])
+    with back_col:
+        if st.button("← Home"):
+            go_home(); st.rerun()
+
+    st.markdown("<h2 style='margin:0.5rem 0 1rem 0'>📊 Standings & Leaderboards</h2>",
+                unsafe_allow_html=True)
+
+    tab_st, tab_lb = st.tabs(["📊 Group Standings", "🏆 Leaderboards"])
+
+    with tab_st:
+        standings = compute_standings()
+        st.caption(
+            "Standings are derived from player goal tallies and may differ slightly "
+            "from official scores when own goals are involved. "
+            "Top 2 from each group qualify automatically; best 8 third-place teams also advance."
+        )
+        st.markdown("")
+        for row_start in range(0, 12, 3):
+            cols = st.columns(3, gap="medium")
+            for ci, g in enumerate(GROUP_LETTERS[row_start:row_start + 3]):
+                color = GROUP_COLORS[g]
+                group_teams = sorted(
+                    [t for t in standings.values() if t["group"] == g],
+                    key=lambda x: (-x["Pts"], -x["GD"], -x["GF"]),
+                )
+                table_rows = []
+                for t in group_teams:
+                    flag = COUNTRY_FLAGS.get(t["country"], "")
+                    gd = t["GD"]
+                    gd_str = f"+{gd}" if gd > 0 else str(gd)
+                    table_rows.append({
+                        "Team": f"{flag} {t['name']}",
+                        "P":    t["P"],
+                        "Pts":  t["Pts"],
+                        "GD":   gd_str,
+                        "W":    t["W"],
+                        "D":    t["D"],
+                        "L":    t["L"],
+                        "GF":   t["GF"],
+                        "GA":   t["GA"],
+                    })
+                with cols[ci]:
+                    st.markdown(
+                        f"<div style='color:{color};font-weight:800;font-size:0.95rem;"
+                        f"letter-spacing:2px;margin-bottom:6px;text-transform:uppercase'>"
+                        f"Group {g}</div>",
+                        unsafe_allow_html=True,
+                    )
+                    st.dataframe(
+                        table_rows,
+                        use_container_width=True,
+                        hide_index=True,
+                        height=175,
+                        column_config={
+                            "Team": st.column_config.TextColumn(width="medium"),
+                            "P":    st.column_config.NumberColumn(width="small"),
+                            "W":    st.column_config.NumberColumn(width="small"),
+                            "D":    st.column_config.NumberColumn(width="small"),
+                            "L":    st.column_config.NumberColumn(width="small"),
+                            "GF":   st.column_config.NumberColumn(width="small"),
+                            "GA":   st.column_config.NumberColumn(width="small"),
+                            "GD":   st.column_config.TextColumn(width="small"),
+                            "Pts":  st.column_config.NumberColumn(width="small"),
+                        },
+                    )
+            st.markdown("")
+
+    with tab_lb:
+        lb = build_leaderboard()
+        t_goals, t_assists, t_apps, t_rating, t_cards, t_offsides, t_saves = st.tabs([
+            "⚽ Goals", "🅰️ Assists", "📅 Appearances", "⭐ Rating",
+            "🟨 Cards", "🚩 Offsides", "🧤 Saves (GK)",
+        ])
+        with t_goals:
+            _lb_section(sorted(lb, key=lambda x: (-x["goals"], -x["assists"])), "goals", "Goals")
+        with t_assists:
+            _lb_section(sorted(lb, key=lambda x: (-x["assists"], -x["goals"])), "assists", "Assists")
+        with t_apps:
+            _lb_section(
+                sorted(lb, key=lambda x: (-x["appearances"], -x["minutes"])),
+                "appearances", "Apps",
+            )
+        with t_rating:
+            rated = [r for r in lb if r["rating"] is not None]
+            _lb_section(sorted(rated, key=lambda x: -x["rating"]), "rating", "Avg Rating", decimals=2)
+        with t_cards:
+            _lb_section(
+                sorted(lb, key=lambda x: (-x["yellow"], -x["red"])),
+                "yellow", "🟨",
+                extra_key="red", extra_label="🟥",
+            )
+        with t_offsides:
+            _lb_section(sorted(lb, key=lambda x: -x["offsides"]), "offsides", "Offsides")
+        with t_saves:
+            gks = [r for r in lb if r["position"] == "Goalkeeper"]
+            _lb_section(sorted(gks, key=lambda x: -x["saves"]), "saves", "Saves")
+
+
+# ── Match card helper ──────────────────────────────────────────────────────────
+_PLAYED = {"FT", "AET", "PEN"}
+
+def _render_match_card(fixture, team_id_to_group):
+    played    = fixture["status"] in _PLAYED
+    group     = team_id_to_group.get(fixture["home_team_id"], "?")
+    color     = GROUP_COLORS.get(group, "#3B82F6")
+    home_name = fixture.get("home_team", "")
+    away_name = fixture.get("away_team", "")
+    home_logo = fixture.get("home_logo", "")
+    away_logo = fixture.get("away_logo", "")
+
+    home_img = (
+        f"<img src='{home_logo}' style='width:28px;height:28px;object-fit:contain;vertical-align:middle'>"
+        if home_logo else "🏟️"
+    )
+    away_img = (
+        f"<img src='{away_logo}' style='width:28px;height:28px;object-fit:contain;vertical-align:middle'>"
+        if away_logo else "🏟️"
+    )
+
+    if played:
+        hg = fixture.get("home_goals") or 0
+        ag = fixture.get("away_goals") or 0
+        if hg > ag:
+            h_style, a_style = "font-weight:900;color:white", "color:#64748B"
+        elif ag > hg:
+            h_style, a_style = "color:#64748B", "font-weight:900;color:white"
+        else:
+            h_style = a_style = "font-weight:700;color:white"
+        mid_html = (
+            f"<span style='font-size:1.25rem;font-weight:900;color:white'>{hg} – {ag}</span><br>"
+            f"<span style='font-size:10px;color:#64748B;letter-spacing:1px'>{fixture['status']}</span>"
+        )
+    else:
+        h_style = a_style = "color:#94A3B8"
+        time_str = fixture.get("time", "")
+        mid_html = (
+            f"<span style='font-size:0.95rem;color:#475569;font-weight:600'>vs</span><br>"
+            + (f"<span style='font-size:10px;color:#64748B'>{time_str} UTC</span>" if time_str else "")
+        )
+
+    round_label = fixture.get("round", "")
+    round_pill  = (
+        f"<span style='font-size:10px;color:#64748B;margin-left:8px'>{round_label}</span>"
+        if round_label else ""
+    )
+
+    st.markdown(
+        f"<div style='background:#1E293B;border-radius:10px;padding:10px 14px;"
+        f"margin-bottom:6px;border-left:3px solid {color};'>"
+        f"  <div style='display:flex;align-items:center;'>"
+        f"    <div style='flex:1;display:flex;align-items:center;gap:8px;'>"
+        f"      {home_img}"
+        f"      <span style='font-size:13px;{h_style}'>{home_name}</span>"
+        f"    </div>"
+        f"    <div style='text-align:center;min-width:90px;'>{mid_html}</div>"
+        f"    <div style='flex:1;display:flex;align-items:center;gap:8px;justify-content:flex-end;'>"
+        f"      <span style='font-size:13px;{a_style}'>{away_name}</span>"
+        f"      {away_img}"
+        f"    </div>"
+        f"  </div>"
+        f"  {round_pill}"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+
+# ── VIEW: CALENDAR ─────────────────────────────────────────────────────────────
+def render_calendar():
+    render_banner()
+
+    back_col, _ = st.columns([1, 9])
+    with back_col:
+        if st.button("← Home"):
+            go_home(); st.rerun()
+
+    st.markdown("<h2 style='margin:0.5rem 0 1rem 0'>📅 Match Calendar</h2>",
+                unsafe_allow_html=True)
+
+    if not wc_fixtures:
+        st.info("Match calendar will be available once fixtures are loaded. Check back shortly.")
+        return
+
+    # team_id → group letter (for colored left border on cards)
+    team_id_to_group = {
+        squad[0]["country_id"]: COUNTRY_GROUP.get(country, "?")
+        for country, squad in all_players.items()
+        if squad and squad[0].get("country_id")
+    }
+
+    # Group filter
+    filter_col, _ = st.columns([2, 6])
+    with filter_col:
+        filter_opts = ["All matches"] + [f"Group {g}" for g in GROUP_LETTERS]
+        selected_filter = st.selectbox("Filter by group", filter_opts, label_visibility="collapsed")
+
+    if selected_filter == "All matches":
+        shown = wc_fixtures
+    else:
+        target_group = selected_filter.replace("Group ", "")
+        shown = [
+            f for f in wc_fixtures
+            if team_id_to_group.get(f["home_team_id"]) == target_group
+            or team_id_to_group.get(f["away_team_id"]) == target_group
+        ]
+
+    if not shown:
+        st.info("No matches found for this filter.")
+        return
+
+    # Group by date and render
+    by_date: dict[str, list] = {}
+    for f in shown:
+        by_date.setdefault(f["date"], []).append(f)
+
+    for date in sorted(by_date.keys()):
+        try:
+            dt = datetime.strptime(date, "%Y-%m-%d")
+            date_label = dt.strftime(f"%A, %B {dt.day}")
+        except ValueError:
+            date_label = date
+
+        st.markdown(
+            f"<div style='font-size:0.8rem;font-weight:700;letter-spacing:2px;color:#64748B;"
+            f"text-transform:uppercase;margin:1.2rem 0 0.5rem 0'>{date_label}</div>",
+            unsafe_allow_html=True,
+        )
+        for fixture in sorted(by_date[date], key=lambda x: x.get("time", "")):
+            _render_match_card(fixture, team_id_to_group)
+
+
+# ── Player picker helper ───────────────────────────────────────────────────────
+def _render_player_picker(slot):
+    key_ref = f"compare_p{slot}"
+    ref     = st.session_state.get(key_ref)
+
+    st.markdown(
+        f"<div style='font-size:11px;font-weight:700;color:#94A3B8;letter-spacing:2px;"
+        f"text-transform:uppercase;margin-bottom:8px'>Player {slot}</div>",
+        unsafe_allow_html=True,
+    )
+
+    if ref:
+        player    = all_players[ref["country"]][ref["idx"]]
+        photo_url = (player.get("player_info") or {}).get("photo") or player.get("player_photo", "")
+        flag      = COUNTRY_FLAGS.get(ref["country"], "")
+        country_d = COUNTRY_DISPLAY.get(ref["country"], ref["country"])
+        pos_color = POSITION_COLOR.get(player["position"], "#6B7280")
+
+        ph_col, info_col, btn_col = st.columns([1, 5, 1])
+        with ph_col:
+            if photo_url:
+                st.image(photo_url, width=56)
+            else:
+                st.markdown(
+                    "<div style='width:56px;height:56px;background:#0F172A;border-radius:8px;"
+                    "display:flex;align-items:center;justify-content:center;font-size:24px'>👤</div>",
+                    unsafe_allow_html=True,
+                )
+        with info_col:
+            st.markdown(
+                f"**{player['player']}**<br>"
+                f"<span class='info-pill' style='background:{pos_color};color:white;border:none'>"
+                f"{player['position']}</span> "
+                f"<span class='info-pill'>{flag} {country_d}</span> "
+                f"<span class='info-pill'>🏟️ {player['club']}</span>",
+                unsafe_allow_html=True,
+            )
+        with btn_col:
+            if st.button("✕", key=f"clear_p{slot}", help="Clear selection"):
+                st.session_state[key_ref] = None
+                if f"cmp_q{slot}" in st.session_state:
+                    st.session_state[f"cmp_q{slot}"] = ""
+                st.rerun()
+    else:
+        q = st.text_input(
+            f"Search player {slot}",
+            key=f"cmp_q{slot}",
+            placeholder="Name or club...",
+            label_visibility="collapsed",
+        )
+        if q.strip():
+            qn   = normalize(q.strip())
+            hits = [r for r in SEARCH_INDEX if qn in r["norm"] or qn in r["club_norm"]][:8]
+            if not hits:
+                st.caption("No players found.")
+            for r in hits:
+                r_flag  = COUNTRY_FLAGS.get(r["country"], "")
+                r_cdisp = COUNTRY_DISPLAY.get(r["country"], r["country"])
+                if st.button(
+                    f"{r['player']}  ·  {r_flag} {r_cdisp}  ·  {r['position']}",
+                    key=f"pick_p{slot}_{r['country']}_{r['idx']}",
+                    use_container_width=True,
+                ):
+                    st.session_state[key_ref] = {"country": r["country"], "idx": r["idx"]}
+                    st.rerun()
+
+
+# ── Comparison stat row helper ─────────────────────────────────────────────────
+def _cmp_stat_row(disp1, label, disp2, raw1=None, raw2=None):
+    """P1 stat box | centered label | P2 stat box. Higher value gets green border."""
+    border1 = border2 = ""
+    try:
+        if raw1 is not None and raw2 is not None:
+            if float(raw1) > float(raw2):
+                border1 = "border:2px solid #22C55E;"
+            elif float(raw2) > float(raw1):
+                border2 = "border:2px solid #22C55E;"
+    except (TypeError, ValueError):
+        pass
+    c1, clabel, c2 = st.columns([3, 2, 3])
+    c1.markdown(
+        f"<div class='stat-box' style='{border1}'><div class='stat-val'>{disp1}</div></div>",
+        unsafe_allow_html=True,
+    )
+    clabel.markdown(
+        f"<div style='text-align:center;padding-top:1.1rem;font-size:10px;color:#94A3B8;"
+        f"text-transform:uppercase;letter-spacing:1px;font-weight:700'>{label}</div>",
+        unsafe_allow_html=True,
+    )
+    c2.markdown(
+        f"<div class='stat-box' style='{border2}'><div class='stat-val'>{disp2}</div></div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _render_wc_comparison(p1, p2):
+    wc1  = flatten_wc_aggregate(p1.get("wc_aggregates") or {})
+    wc2  = flatten_wc_aggregate(p2.get("wc_aggregates") or {})
+    pos1 = p1.get("position", "")
+    pos2 = p2.get("position", "")
+
+    if not wc1 and not wc2:
+        st.info("Neither player has WC match data yet — check back after matches are played.")
+        return
+
+    def _r(label, key, decimals=0):
+        v1 = wc1.get(key)
+        v2 = wc2.get(key)
+        d1 = fmt(v1, decimals) if v1 is not None else "—"
+        d2 = fmt(v2, decimals) if v2 is not None else "—"
+        _cmp_stat_row(d1, label, d2, v1, v2)
+
+    nc1, _, nc2 = st.columns([3, 2, 3])
+    nc1.markdown(
+        f"<div style='text-align:center;font-size:13px;font-weight:700;color:#93C5FD;"
+        f"margin-bottom:4px'>{COUNTRY_FLAGS.get(p1.get('country',''),'')}"
+        f" {p1['player']}</div>",
+        unsafe_allow_html=True,
+    )
+    nc2.markdown(
+        f"<div style='text-align:center;font-size:13px;font-weight:700;color:#93C5FD;"
+        f"margin-bottom:4px'>{COUNTRY_FLAGS.get(p2.get('country',''),'')}"
+        f" {p2['player']}</div>",
+        unsafe_allow_html=True,
+    )
+    st.caption("🟢 Green border = higher value")
+    st.markdown("")
+
+    _r("Appearances", "appearances")
+    _r("Minutes",     "minutes")
+    _r("Avg Rating",  "rating", decimals=2)
+    st.markdown("")
+
+    _r("Goals",   "goals")
+    _r("Assists", "assists")
+    if pos1 == "Goalkeeper" or pos2 == "Goalkeeper":
+        _r("Saves",          "saves")
+        _r("Goals Conceded", "conceded")
+    else:
+        _r("Shots",      "shots")
+        _r("Key Passes", "key_passes")
+    st.markdown("")
+
+    _r("Tackles",       "tackles")
+    _r("Interceptions", "interceptions")
+    st.markdown("")
+
+    _r("Yellow Cards", "yellow")
+    _r("Red Cards",    "red")
+    _r("Offsides",     "offsides")
+
+
+def _render_leagues_comparison(p1, p2):
+    col1, col2 = st.columns(2, gap="large")
+
+    for col, player in ((col1, p1), (col2, p2)):
+        with col:
+            flag    = COUNTRY_FLAGS.get(player.get("country", ""), "")
+            country = COUNTRY_DISPLAY.get(player.get("country", ""), player.get("country", ""))
+            st.markdown(
+                f"<div style='font-weight:700;color:white;margin-bottom:8px'>"
+                f"{flag} {player['player']}</div>",
+                unsafe_allow_html=True,
+            )
+            blocks = relevant_blocks(player)
+            if not blocks:
+                st.caption("No 2025/2026 season stats available.")
+                continue
+            pos = player.get("position", "")
+            for b in sorted(
+                blocks,
+                key=lambda x: (x.get("games", {}).get("appearences") or 0, x.get("_season", 0)),
+                reverse=True,
+            ):
+                games  = b.get("games", {}) or {}
+                league = b.get("league", {}) or {}
+                team   = b.get("team", {}) or {}
+                goals  = b.get("goals", {}) or {}
+                apps   = games.get("appearences") or 0
+                mins   = games.get("minutes") or 0
+                rating = games.get("rating")
+                if not apps:
+                    continue
+                logo_html = (
+                    f"<img src='{team.get('logo','')}' style='width:20px;height:20px;"
+                    f"object-fit:contain;border-radius:3px'>"
+                    if team.get("logo") else "🏟️"
+                )
+                flag_html = (
+                    f"<img src='{league.get('flag','')}' style='width:16px;height:11px;"
+                    f"object-fit:cover;border-radius:2px'>"
+                    if league.get("flag") else ""
+                )
+                rating_str = f" · ⭐ {float(rating):.2f}" if rating else ""
+                if pos == "Goalkeeper":
+                    extra = f" · 🧤 {goals.get('saves') or 0} saves"
+                else:
+                    extra = (
+                        f" · ⚽ {goals.get('total') or 0}"
+                        f"  · 🅰️ {goals.get('assists') or 0}"
+                    )
+                st.markdown(
+                    f"<div class='league-row'>"
+                    f"  {logo_html}"
+                    f"  <div style='flex:1'>"
+                    f"    <div class='league-name'>{team.get('name','—')}</div>"
+                    f"    <div class='league-sub'>{flag_html} {league.get('name','—')} · "
+                    f"    {apps} apps · {mins} min{rating_str}{extra}</div>"
+                    f"  </div>"
+                    f"  <span class='info-pill'>{season_label(b)}</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+
+# ── VIEW: COMPARE ──────────────────────────────────────────────────────────────
+def render_compare():
+    render_banner()
+
+    back_col, _ = st.columns([1, 9])
+    with back_col:
+        if st.button("← Home"):
+            go_home(); st.rerun()
+
+    st.markdown("<h2 style='margin:0.5rem 0 1rem 0'>⚔️ Player Comparison</h2>",
+                unsafe_allow_html=True)
+
+    pick1, pick2 = st.columns(2, gap="large")
+    with pick1:
+        _render_player_picker(1)
+    with pick2:
+        _render_player_picker(2)
+
+    p1_ref = st.session_state.get("compare_p1")
+    p2_ref = st.session_state.get("compare_p2")
+
+    if not p1_ref or not p2_ref:
+        st.markdown("")
+        st.info("Search and select two players above to compare them.")
+        return
+
+    p1 = all_players[p1_ref["country"]][p1_ref["idx"]]
+    p2 = all_players[p2_ref["country"]][p2_ref["idx"]]
+
+    st.divider()
+
+    tab_wc, tab_leagues = st.tabs(["⚽ World Cup Stats", "🏆 Pre-WC Leagues"])
+    with tab_wc:
+        _render_wc_comparison(p1, p2)
+    with tab_leagues:
+        _render_leagues_comparison(p1, p2)
+
+
 # ── VIEW: HOME ─────────────────────────────────────────────────────────────────
 def render_home():
     render_banner()
+
+    _c1, _c2, _c3, _ = st.columns([2, 2, 2, 2])
+    with _c1:
+        if st.button("📊 Standings & Leaderboards →", use_container_width=True):
+            go_standings(); st.rerun()
+    with _c2:
+        if st.button("📅 Match Calendar →", use_container_width=True):
+            go_calendar(); st.rerun()
+    with _c3:
+        if st.button("⚔️ Compare Players →", use_container_width=True):
+            go_compare(); st.rerun()
+    st.markdown("")
 
     query = st.text_input(
         "🔍 Search for a player or club",
@@ -695,8 +1398,8 @@ def render_country():
         "breakdown. FIFA Club World Cup appearances are excluded."
     )
 
-    tab_wc, tab_overview, tab_attack, tab_defense, tab_leagues = st.tabs(
-        ["🌎 World Cup Performance", "📅 Pre-WC Overview", "⚡ Pre-WC Attacking", "🛡️ Pre-WC Defensive", "🏆 Pre-WC Leagues"]
+    tab_wc, tab_leagues = st.tabs(
+        ["🌎 World Cup Performance", "🏆 Pre-WC Leagues"]
     )
 
     # ── World Cup Performance ────────────────────────────────────────────────
@@ -742,68 +1445,8 @@ def render_country():
                 },
             )
 
-    if stats:
-        with tab_overview:
-            st.caption(STATS_NOTE)
-            c = st.columns(5)
-            c[0].markdown(stat_box(fmt(stats["appearances"]), "Appearances"), unsafe_allow_html=True)
-            c[1].markdown(stat_box(fmt(stats["minutes"]), "Minutes"), unsafe_allow_html=True)
-            c[2].markdown(stat_box(fmt(stats["rating"], 2) if stats["rating"] else "—", "Avg Rating"), unsafe_allow_html=True)
-            c[3].markdown(stat_box(fmt(stats["goals"]), "Goals"), unsafe_allow_html=True)
-            c[4].markdown(stat_box(fmt(stats["assists"]), "Assists"), unsafe_allow_html=True)
-
-            st.markdown("")
-            c2 = st.columns(5)
-            c2[0].markdown(stat_box(fmt(stats["yellow"]), "Yellow Cards"), unsafe_allow_html=True)
-            c2[1].markdown(stat_box(fmt(stats["red"]), "Red Cards"), unsafe_allow_html=True)
-            c2[2].markdown(stat_box(fmt(stats["fouls_comm"]), "Fouls Committed"), unsafe_allow_html=True)
-            c2[3].markdown(stat_box(fmt(stats["fouls_drawn"]), "Fouls Drawn"), unsafe_allow_html=True)
-            if pos == "Goalkeeper":
-                c2[4].markdown(stat_box(fmt(stats["saves"]), "Saves"), unsafe_allow_html=True)
-            else:
-                c2[4].markdown(stat_box(pct(stats["duels_won"], stats["duels_total"]), "Duels Won"), unsafe_allow_html=True)
-
-        with tab_attack:
-            st.caption(STATS_NOTE)
-            if pos == "Goalkeeper":
-                c = st.columns(4)
-                c[0].markdown(stat_box(fmt(stats["saves"]), "Saves"), unsafe_allow_html=True)
-                c[1].markdown(stat_box(fmt(stats["conceded"]), "Goals Conceded"), unsafe_allow_html=True)
-                c[2].markdown(stat_box(fmt(stats["pen_saved"]), "Penalties Saved"), unsafe_allow_html=True)
-                c[3].markdown(stat_box(fmt(stats["passes"]), "Total Passes"), unsafe_allow_html=True)
-            else:
-                c = st.columns(5)
-                c[0].markdown(stat_box(fmt(stats["goals"]), "Goals"), unsafe_allow_html=True)
-                c[1].markdown(stat_box(fmt(stats["assists"]), "Assists"), unsafe_allow_html=True)
-                c[2].markdown(stat_box(fmt(stats["shots"]), "Shots"), unsafe_allow_html=True)
-                c[3].markdown(stat_box(fmt(stats["shots_on"]), "On Target"), unsafe_allow_html=True)
-                c[4].markdown(stat_box(pct(stats["shots_on"], stats["shots"]), "Shot Accuracy"), unsafe_allow_html=True)
-
-                st.markdown("")
-                c2 = st.columns(5)
-                c2[0].markdown(stat_box(fmt(stats["key_passes"]), "Key Passes"), unsafe_allow_html=True)
-                c2[1].markdown(stat_box(fmt(stats["passes"]), "Total Passes"), unsafe_allow_html=True)
-                c2[2].markdown(stat_box(fmt(stats["dribbles_att"]), "Dribbles Att."), unsafe_allow_html=True)
-                c2[3].markdown(stat_box(fmt(stats["dribbles_ok"]), "Dribbles Won"), unsafe_allow_html=True)
-                c2[4].markdown(stat_box(pct(stats["dribbles_ok"], stats["dribbles_att"]), "Dribble Success"), unsafe_allow_html=True)
-
-                if stats["pen_scored"] or stats["pen_missed"]:
-                    st.markdown("")
-                    c3 = st.columns(3)
-                    c3[0].markdown(stat_box(fmt(stats["pen_scored"]), "Penalties Scored"), unsafe_allow_html=True)
-                    c3[1].markdown(stat_box(fmt(stats["pen_missed"]), "Penalties Missed"), unsafe_allow_html=True)
-                    c3[2].markdown(stat_box(pct(stats["pen_scored"], stats["pen_scored"] + stats["pen_missed"]), "Penalty Conv."), unsafe_allow_html=True)
-
-        with tab_defense:
-            st.caption(STATS_NOTE)
-            c = st.columns(5)
-            c[0].markdown(stat_box(fmt(stats["tackles"]), "Tackles"), unsafe_allow_html=True)
-            c[1].markdown(stat_box(fmt(stats["interceptions"]), "Interceptions"), unsafe_allow_html=True)
-            c[2].markdown(stat_box(fmt(stats["blocks"]), "Blocks"), unsafe_allow_html=True)
-            c[3].markdown(stat_box(fmt(stats["duels_total"]), "Duels"), unsafe_allow_html=True)
-            c[4].markdown(stat_box(pct(stats["duels_won"], stats["duels_total"]), "Duels Won %"), unsafe_allow_html=True)
-
-        with tab_leagues:
+    with tab_leagues:
+        if stats:
             st.markdown("**Season appearances by league (2025 & 2026)**")
             st.caption(
                 "ℹ️ Seasons are labeled **2025-26** for leagues that run "
@@ -862,8 +1505,7 @@ def render_country():
                     f"</div>",
                     unsafe_allow_html=True,
                 )
-    else:
-        with tab_overview:
+        else:
             st.info("No 2025/2026 season statistics available for this player.")
 
     st.divider()
@@ -914,9 +1556,12 @@ def render_country():
 
 # ── Router ─────────────────────────────────────────────────────────────────────
 view = st.session_state.view
-if   view == "home":    render_home()
-elif view == "group":   render_group()
-elif view == "country": render_country()
+if   view == "home":      render_home()
+elif view == "group":     render_group()
+elif view == "country":   render_country()
+elif view == "standings": render_standings()
+elif view == "calendar":  render_calendar()
+elif view == "compare":   render_compare()
 
 # ── Footer ─────────────────────────────────────────────────────────────────────
 st.markdown(
