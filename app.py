@@ -32,7 +32,6 @@ def track(event, **props):
     if client:
         try:
             client.capture(event, distinct_id=sid, properties=props)
-            client.flush()
         except Exception:
             pass
 
