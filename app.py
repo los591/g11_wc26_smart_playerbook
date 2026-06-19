@@ -31,7 +31,7 @@ def track(event, **props):
     client = _ph_client()
     if client:
         try:
-            client.capture(sid, event, props)
+            client.capture(event, distinct_id=sid, properties=props)
         except Exception:
             pass
 
