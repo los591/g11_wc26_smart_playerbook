@@ -5,7 +5,6 @@ import uuid
 from datetime import datetime, timezone
 from urllib.parse import quote, unquote
 from zoneinfo import ZoneInfo
-import requests
 import streamlit as st
 from posthog import Posthog
 
@@ -226,10 +225,9 @@ def relevant_blocks(player):
 
 @st.cache_data(ttl=3600)
 def load_data():
-    url = "https://raw.githubusercontent.com/los591/g11-data/main/og_backup_pre_inaug.json"
-    resp = requests.get(url, headers={"Authorization": f"token {st.secrets['github_token']}"}, timeout=30)
-    resp.raise_for_status()
-    flat = resp.json()
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../g11-data/og_backup_pre_inaug.json")
+    with open(path, encoding="utf-8") as f:
+        flat = json.load(f)
 
     all_players: dict[str, list] = {}
     for p in flat:
@@ -253,12 +251,11 @@ COUNTRY_DISPLAY = {
 
 @st.cache_data(ttl=3600)
 def load_fixtures():
-    url = "https://raw.githubusercontent.com/los591/g11-data/main/wc_fixtures.json"
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../g11-data/wc_fixtures.json")
     try:
-        resp = requests.get(url, headers={"Authorization": f"token {st.secrets['github_token']}"}, timeout=30)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
         return []
 
 wc_fixtures = load_fixtures()
@@ -913,7 +910,10 @@ def render_calendar():
                 unsafe_allow_html=True)
 
     if not wc_fixtures:
-        st.info("Match calendar will be available once fixtures are loaded. Check back shortly.")
+        st.info(
+            "No fixture data yet. Run `python db_mgmt/fetch_wc_current_stats.py` "
+            "from `g11-data/` to generate `wc_fixtures.json`."
+        )
         return
 
     # team_id → group letter (for colored left border on cards)
