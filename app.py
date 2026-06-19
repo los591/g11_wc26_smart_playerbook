@@ -1,8 +1,9 @@
 import json
 import os
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import quote, unquote
+from zoneinfo import ZoneInfo
 import requests
 import streamlit as st
 
@@ -21,17 +22,29 @@ for key, default in [
     ("selected_player", 0),
     ("compare_p1", None),
     ("compare_p2", None),
+    ("calendar_tz", "UTC"),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
 
-# ── Deep-link handling (e.g. clicking a player photo in search results) ────────
+# ── Deep-link handling ─────────────────────────────────────────────────────────
 if "player" in st.query_params:
     try:
         enc_country, idx_str = st.query_params["player"].split("|")
         st.session_state.view = "country"
         st.session_state.selected_country = unquote(enc_country)
         st.session_state.selected_player = int(idx_str)
+    except (ValueError, KeyError):
+        pass
+    st.query_params.clear()
+    st.rerun()
+
+if "country" in st.query_params:
+    try:
+        country_key = unquote(st.query_params["country"])
+        st.session_state.view = "country"
+        st.session_state.selected_country = country_key
+        st.session_state.selected_player = 0
     except (ValueError, KeyError):
         pass
     st.query_params.clear()
@@ -310,13 +323,13 @@ def compute_standings():
 
 @st.cache_data(ttl=3600)
 def build_leaderboard():
-    """Flat list of all players who have appeared in at least one WC match."""
+    """Flat list of all players who have played at least 1 WC minute."""
     rows = []
     for country, squad in all_players.items():
         for idx, player in enumerate(squad):
             agg = player.get("wc_aggregates") or {}
-            appearances = agg.get("appearances") or 0
-            if not appearances:
+            minutes = (agg.get("games") or {}).get("minutes") or 0
+            if not minutes:
                 continue
             games   = agg.get("games") or {}
             goals_d = agg.get("goals") or {}
@@ -332,8 +345,7 @@ def build_leaderboard():
                 "idx":         idx,
                 "position":    player.get("position", ""),
                 "photo":       (player.get("player_info") or {}).get("photo") or player.get("player_photo", ""),
-                "appearances": appearances,
-                "minutes":     games.get("minutes") or 0,
+                "minutes":     minutes,
                 "goals":       goals_d.get("total") or 0,
                 "assists":     goals_d.get("assists") or 0,
                 "saves":       goals_d.get("saves") or 0,
@@ -725,28 +737,23 @@ def render_standings():
 
     with tab_lb:
         lb = build_leaderboard()
-        t_goals, t_assists, t_apps, t_rating, t_cards, t_offsides, t_saves = st.tabs([
-            "⚽ Goals", "🅰️ Assists", "📅 Appearances", "⭐ Rating",
-            "🟨 Cards", "🚩 Offsides", "🧤 Saves (GK)",
+        t_goals, t_assists, t_mins, t_rating, t_yellow, t_red, t_offsides, t_saves = st.tabs([
+            "⚽ Goals", "🅰️ Assists", "⏱️ Minutes", "⭐ Rating",
+            "🟨 Yellow Cards", "🟥 Red Cards", "🚩 Offsides", "🧤 Saves (GK)",
         ])
         with t_goals:
             _lb_section(sorted(lb, key=lambda x: (-x["goals"], -x["assists"])), "goals", "Goals")
         with t_assists:
             _lb_section(sorted(lb, key=lambda x: (-x["assists"], -x["goals"])), "assists", "Assists")
-        with t_apps:
-            _lb_section(
-                sorted(lb, key=lambda x: (-x["appearances"], -x["minutes"])),
-                "appearances", "Apps",
-            )
+        with t_mins:
+            _lb_section(sorted(lb, key=lambda x: -x["minutes"]), "minutes", "Minutes")
         with t_rating:
             rated = [r for r in lb if r["rating"] is not None]
             _lb_section(sorted(rated, key=lambda x: -x["rating"]), "rating", "Avg Rating", decimals=2)
-        with t_cards:
-            _lb_section(
-                sorted(lb, key=lambda x: (-x["yellow"], -x["red"])),
-                "yellow", "🟨",
-                extra_key="red", extra_label="🟥",
-            )
+        with t_yellow:
+            _lb_section(sorted(lb, key=lambda x: (-x["yellow"], -x["minutes"])), "yellow", "🟨 Yellow Cards")
+        with t_red:
+            _lb_section(sorted(lb, key=lambda x: (-x["red"], -x["minutes"])), "red", "🟥 Red Cards")
         with t_offsides:
             _lb_section(sorted(lb, key=lambda x: -x["offsides"]), "offsides", "Offsides")
         with t_saves:
@@ -757,6 +764,26 @@ def render_standings():
 # ── Match card helper ──────────────────────────────────────────────────────────
 _PLAYED = {"FT", "AET", "PEN"}
 
+# Display label → IANA timezone name
+TIMEZONES = {
+    "UTC":               "UTC",
+    "ET  — New York / Miami":        "America/New_York",
+    "CT  — Chicago / Mexico City":   "America/Chicago",
+    "MT  — Denver / Calgary":        "America/Denver",
+    "PT  — Los Angeles / Vancouver": "America/Los_Angeles",
+    "BRT — São Paulo / Buenos Aires":"America/Sao_Paulo",
+    "GMT — London / Lisbon":         "Europe/London",
+    "CET — Paris / Madrid / Rome":   "Europe/Paris",
+    "EET — Cairo / Istanbul":        "Europe/Istanbul",
+    "GST — Dubai / Riyadh":          "Asia/Dubai",
+    "PKT — Karachi":                 "Asia/Karachi",
+    "IST — Mumbai / Delhi":          "Asia/Kolkata",
+    "WIB — Jakarta":                 "Asia/Jakarta",
+    "CST — Beijing / Seoul":         "Asia/Shanghai",
+    "JST — Tokyo":                   "Asia/Tokyo",
+    "AEST— Sydney / Melbourne":      "Australia/Sydney",
+}
+
 def _render_match_card(fixture, team_id_to_group):
     played    = fixture["status"] in _PLAYED
     group     = team_id_to_group.get(fixture["home_team_id"], "?")
@@ -765,6 +792,15 @@ def _render_match_card(fixture, team_id_to_group):
     away_name = fixture.get("away_team", "")
     home_logo = fixture.get("home_logo", "")
     away_logo = fixture.get("away_logo", "")
+
+    # Wrap team names in country deep-links when available
+    link_style = "color:inherit;text-decoration:underline;text-decoration-style:dotted;text-underline-offset:3px"
+    home_key = fixture.get("_home_country_key")
+    away_key = fixture.get("_away_country_key")
+    if home_key:
+        home_name = f"<a href='?country={quote(home_key)}' target='_self' style='{link_style}'>{home_name}</a>"
+    if away_key:
+        away_name = f"<a href='?country={quote(away_key)}' target='_self' style='{link_style}'>{away_name}</a>"
 
     home_img = (
         f"<img src='{home_logo}' style='width:28px;height:28px;object-fit:contain;vertical-align:middle'>"
@@ -790,10 +826,11 @@ def _render_match_card(fixture, team_id_to_group):
         )
     else:
         h_style = a_style = "color:#94A3B8"
-        time_str = fixture.get("time", "")
+        time_str = fixture.get("_local_time") or fixture.get("time", "")
+        tz_label = fixture.get("_tz_abbr", "UTC")
         mid_html = (
             f"<span style='font-size:0.95rem;color:#475569;font-weight:600'>vs</span><br>"
-            + (f"<span style='font-size:10px;color:#64748B'>{time_str} UTC</span>" if time_str else "")
+            + (f"<span style='font-size:10px;color:#64748B'>{time_str} {tz_label}</span>" if time_str else "")
         )
 
     round_label = fixture.get("round", "")
@@ -844,12 +881,29 @@ def render_calendar():
         for country, squad in all_players.items()
         if squad and squad[0].get("country_id")
     }
+    # team_id → internal country key (Spanish name, used for deep-link navigation)
+    team_id_to_country_key = {
+        squad[0]["country_id"]: country
+        for country, squad in all_players.items()
+        if squad and squad[0].get("country_id")
+    }
 
-    # Group filter
-    filter_col, _ = st.columns([2, 6])
+    # Controls row: group filter + timezone selector
+    filter_col, tz_col, _ = st.columns([2, 3, 3])
     with filter_col:
         filter_opts = ["All matches"] + [f"Group {g}" for g in GROUP_LETTERS]
         selected_filter = st.selectbox("Filter by group", filter_opts, label_visibility="collapsed")
+    with tz_col:
+        tz_labels = list(TIMEZONES.keys())
+        saved_tz  = st.session_state.get("calendar_tz", "UTC")
+        saved_idx = tz_labels.index(saved_tz) if saved_tz in tz_labels else 0
+        selected_tz_label = st.selectbox(
+            "Timezone", tz_labels, index=saved_idx, label_visibility="collapsed"
+        )
+        st.session_state["calendar_tz"] = selected_tz_label
+
+    tz = ZoneInfo(TIMEZONES[selected_tz_label])
+    tz_abbr = selected_tz_label.split("—")[0].strip()
 
     if selected_filter == "All matches":
         shown = wc_fixtures
@@ -865,10 +919,32 @@ def render_calendar():
         st.info("No matches found for this filter.")
         return
 
-    # Group by date and render
+    # Convert each fixture to local time and group by local date
+    def _localise(f):
+        date_s, time_s = f.get("date", ""), f.get("time", "")
+        extra = {
+            "_home_country_key": team_id_to_country_key.get(f.get("home_team_id")),
+            "_away_country_key": team_id_to_country_key.get(f.get("away_team_id")),
+            "_tz_abbr": tz_abbr,
+        }
+        if date_s and time_s:
+            try:
+                utc_dt = datetime.strptime(f"{date_s} {time_s}", "%Y-%m-%d %H:%M").replace(
+                    tzinfo=timezone.utc
+                )
+                local_dt = utc_dt.astimezone(tz)
+                return {**f, **extra,
+                        "_local_date": local_dt.strftime("%Y-%m-%d"),
+                        "_local_time": local_dt.strftime("%H:%M")}
+            except ValueError:
+                pass
+        return {**f, **extra, "_local_date": date_s, "_local_time": time_s}
+
+    localised = [_localise(f) for f in shown]
+
     by_date: dict[str, list] = {}
-    for f in shown:
-        by_date.setdefault(f["date"], []).append(f)
+    for f in localised:
+        by_date.setdefault(f["_local_date"], []).append(f)
 
     for date in sorted(by_date.keys()):
         try:
@@ -882,7 +958,7 @@ def render_calendar():
             f"text-transform:uppercase;margin:1.2rem 0 0.5rem 0'>{date_label}</div>",
             unsafe_allow_html=True,
         )
-        for fixture in sorted(by_date[date], key=lambda x: x.get("time", "")):
+        for fixture in sorted(by_date[date], key=lambda x: x.get("_local_time", "")):
             _render_match_card(fixture, team_id_to_group)
 
 
@@ -938,7 +1014,7 @@ def _render_player_picker(slot):
         )
         if q.strip():
             qn   = normalize(q.strip())
-            hits = [r for r in SEARCH_INDEX if qn in r["norm"] or qn in r["club_norm"]][:8]
+            hits = [r for r in SEARCH_INDEX if qn in r["norm"] or qn in r["club_norm"]][:25]
             if not hits:
                 st.caption("No players found.")
             for r in hits:
@@ -1014,8 +1090,7 @@ def _render_wc_comparison(p1, p2):
     st.caption("🟢 Green border = higher value")
     st.markdown("")
 
-    _r("Appearances", "appearances")
-    _r("Minutes",     "minutes")
+    _r("Minutes", "minutes")
     _r("Avg Rating",  "rating", decimals=2)
     st.markdown("")
 
@@ -1313,13 +1388,14 @@ def render_country():
         st.rerun()
 
     # ── Header / breadcrumb ───────────────────────────────────────────────────
-    back, home, title = st.columns([1, 1, 7])
+    back, home, cal, title = st.columns([1, 1, 1, 6])
     with back:
         if st.button(f"← Group {group}"):
-            st.session_state.view = "group"
-            st.session_state.selected_country = None; st.rerun()
+            go_group(group); st.rerun()
     with home:
         if st.button("🏠 Home"): go_home(); st.rerun()
+    with cal:
+        if st.button("📅 Calendar"): go_calendar(); st.rerun()
     with title:
         st.markdown(
             f"<div class='breadcrumb'>Groups › "
@@ -1415,12 +1491,11 @@ def render_country():
                        f"{'es' if wc_stats['appearances'] != 1 else ''} played so far for "
                        f"{wc_aggregates.get('team', player['country'])}.")
 
-            c = st.columns(5)
-            c[0].markdown(stat_box(fmt(wc_stats["appearances"]), "Appearances"), unsafe_allow_html=True)
-            c[1].markdown(stat_box(fmt(wc_stats["minutes"]), "Minutes"), unsafe_allow_html=True)
-            c[2].markdown(stat_box(fmt(wc_stats["rating"], 2) if wc_stats["rating"] else "—", "Avg Rating"), unsafe_allow_html=True)
-            c[3].markdown(stat_box(fmt(wc_stats["goals"]), "Goals"), unsafe_allow_html=True)
-            c[4].markdown(stat_box(fmt(wc_stats["assists"]), "Assists"), unsafe_allow_html=True)
+            c = st.columns(4)
+            c[0].markdown(stat_box(fmt(wc_stats["minutes"]), "Minutes"), unsafe_allow_html=True)
+            c[1].markdown(stat_box(fmt(wc_stats["rating"], 2) if wc_stats["rating"] else "—", "Avg Rating"), unsafe_allow_html=True)
+            c[2].markdown(stat_box(fmt(wc_stats["goals"]), "Goals"), unsafe_allow_html=True)
+            c[3].markdown(stat_box(fmt(wc_stats["assists"]), "Assists"), unsafe_allow_html=True)
 
             st.markdown("")
             c2 = st.columns(5)
