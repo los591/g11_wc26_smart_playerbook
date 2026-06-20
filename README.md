@@ -33,6 +33,10 @@ Stats refresh automatically every 6 hours throughout the tournament.
 
 Player and fixture data lives in a private companion repository and is fetched at runtime via the GitHub API. The dataset covers all 1,247 players including pre-tournament injury replacements.
 
+## Browser compatibility
+
+Best experienced in Chrome or Firefox. Safari users may need to update to Safari 16.4+ (available via System Preferences → Software Update on macOS).
+
 ## Contact
 
 Questions, research inquiries, or just want to talk soccer?
