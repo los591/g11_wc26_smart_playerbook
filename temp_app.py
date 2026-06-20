@@ -260,6 +260,24 @@ def load_fixtures():
 
 wc_fixtures = load_fixtures()
 
+def load_last_updated():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../g11-data/og_backup_pre_inaug.json")
+    try:
+        mtime = os.path.getmtime(path)
+        dt = datetime.fromtimestamp(mtime, tz=timezone.utc)
+        delta = datetime.now(timezone.utc) - dt
+        hours = int(delta.total_seconds() // 3600)
+        if hours < 1:
+            return "updated less than an hour ago"
+        elif hours == 1:
+            return "updated 1 hour ago"
+        else:
+            return f"updated {hours} hours ago"
+    except Exception:
+        return None
+
+last_updated = load_last_updated()
+
 # ── Search index ───────────────────────────────────────────────────────────────
 def normalize(s):
     s = unicodedata.normalize("NFD", s or "")
@@ -1694,3 +1712,9 @@ st.markdown(
     "</div>",
     unsafe_allow_html=True,
 )
+if last_updated:
+    st.markdown(
+        f"<div style='text-align:center; font-size:11px; color:#475569; margin-top:4px;'>"
+        f"🔄 Stats {last_updated}</div>",
+        unsafe_allow_html=True,
+    )

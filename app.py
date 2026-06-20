@@ -263,6 +263,33 @@ def load_fixtures():
 
 wc_fixtures = load_fixtures()
 
+def load_last_updated():
+    try:
+        url = "https://api.github.com/repos/los591/g11-data/commits"
+        resp = requests.get(
+            url,
+            headers={"Authorization": f"token {st.secrets['github_token']}"},
+            params={"path": "og_backup_pre_inaug.json", "per_page": 1},
+            timeout=10,
+        )
+        data = resp.json()
+        if data and isinstance(data, list):
+            iso = data[0]["commit"]["committer"]["date"]
+            dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+            delta = datetime.now(timezone.utc) - dt
+            hours = int(delta.total_seconds() // 3600)
+            if hours < 1:
+                return "updated less than an hour ago"
+            elif hours == 1:
+                return "updated 1 hour ago"
+            else:
+                return f"updated {hours} hours ago"
+    except Exception:
+        pass
+    return None
+
+last_updated = load_last_updated()
+
 # ── Search index ───────────────────────────────────────────────────────────────
 def normalize(s):
     s = unicodedata.normalize("NFD", s or "")
@@ -1694,3 +1721,9 @@ st.markdown(
     "</div>",
     unsafe_allow_html=True,
 )
+if last_updated:
+    st.markdown(
+        f"<div style='text-align:center; font-size:11px; color:#475569; margin-top:4px;'>"
+        f"🔄 Stats {last_updated}</div>",
+        unsafe_allow_html=True,
+    )
