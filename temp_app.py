@@ -1706,9 +1706,9 @@ st.markdown(
     "<div style='text-align:center; margin-top:2.5rem; padding:1rem;"
     " border-top:1px solid #1E293B; font-size:12px; color:#64748B;'>"
     "Questions or interested in accessing the underlying data for research? "
-    "Email <a href='mailto:codingexperimentscarlos@gmail.com' "
+    "Email <a href='mailto:Los0636@gmail.com' "
     "style='color:#93C5FD; text-decoration:none;'>"
-    "codingexperimentscarlos@gmail.com</a>"
+    "Los0636@gmail.com</a>"
     "</div>",
     unsafe_allow_html=True,
 )
