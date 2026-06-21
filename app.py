@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 import requests
 import streamlit as st
 from posthog import Posthog
+from google import genai as _genai
 
 st.set_page_config(
     page_title="FIFA World Cup 2026",
@@ -45,6 +46,7 @@ for key, default in [
     ("compare_p2", None),
     ("calendar_tz", "UTC"),
     ("session_id", None),
+    ("chat_messages", []),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -628,6 +630,118 @@ def go_compare():
     st.session_state.view = "compare"
     st.session_state.selected_group = st.session_state.selected_country = None
     st.session_state.selected_player = 0
+
+def go_chatbot():
+    track("page_viewed", view="chatbot")
+    st.session_state.view = "chatbot"
+    st.session_state.selected_group = st.session_state.selected_country = None
+    st.session_state.selected_player = 0
+
+# ── G-11 AI Analyst ────────────────────────────────────────────────────────────
+@st.cache_resource
+def _gemini_client():
+    key = st.secrets.get("GEMINI_API_KEY", "")
+    if not key:
+        return None
+    return _genai.Client(api_key=key)
+
+_DIEGO_SYSTEM = """You are G-11, a passionate and witty World Cup 2026 expert analyst.
+You ONLY answer questions based on the tournament data provided below — completed fixtures, player stats, and squad info.
+Do not speculate beyond the data. Be concise, insightful, and speak like someone who loves the game.
+If asked something not covered by the data, say you can only speak to what's happening at WC 2026.
+
+{context}
+
+=== CONVERSATION ===""
+
+@st.cache_data(ttl=3600)
+def _build_context():
+    players = load_data()
+    fixtures = load_fixtures()
+    _PLAYED = {"FT", "AET", "PEN"}
+    lines = [
+        "FIFA World Cup 2026 | USA · Canada · Mexico | 48 teams, 104 fixtures, 1,248 players",
+        "",
+        "COMPLETED FIXTURES:",
+    ]
+    for f in sorted(fixtures, key=lambda x: x["date"]):
+        if f.get("status") in _PLAYED:
+            lines.append(
+                f"  {f['date']} | {f['round']} | "
+                f"{f['home_team']} {f['home_goals']}-{f['away_goals']} {f['away_team']}"
+            )
+    lines += ["", "ALL SQUAD PLAYERS (WC 2026):"]
+    for squad in players.values():
+        for p in squad:
+            agg = p.get("wc_aggregates")
+            if agg and agg.get("appearances", 0):
+                g = agg.get("goals", {})
+                lines.append(
+                    f"  {p['player']} | {p['country_for_app']} | {p['position']} | {p['club']} | "
+                    f"Apps:{agg['appearances']} Min:{agg['games']['minutes']} "
+                    f"Rating:{agg['games'].get('rating','N/A')} "
+                    f"Goals:{g.get('total',0)} Assists:{g.get('assists',0)} "
+                    f"Shots:{agg['shots']['total']} OnTarget:{agg['shots']['on']} "
+                    f"Passes:{agg['passes']['total']} PassAcc:{agg['passes']['accuracy']}% "
+                    f"Tackles:{agg['tackles']['total']} "
+                    f"Yellow:{agg['cards']['yellow']} Red:{agg['cards']['red']} "
+                    f"Saves:{g.get('saves',0)} Offsides:{agg.get('offsides',0)}"
+                )
+            else:
+                lines.append(
+                    f"  {p['player']} | {p['country_for_app']} | {p['position']} | {p['club']} | No WC appearances yet"
+                )
+    return "\n".join(lines)
+
+def _ask_diego(question, history):
+    client = _gemini_client()
+    if not client:
+        return "G-11 is unavailable — add GEMINI_API_KEY to Streamlit Cloud secrets to activate."
+    context = _build_context()
+    prompt = _DIEGO_SYSTEM.format(context=context)
+    for msg in history[:-1]:
+        role = "User" if msg["role"] == "user" else "G-11"
+        prompt += f"\n{role}: {msg['content']}"
+    prompt += f"\nUser: {question}\nG-11:"
+    try:
+        response = _gemini_client().models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
+        return response.text.strip()
+    except Exception as e:
+        return f"G-11 ran into an issue: {e}"
+
+def render_chatbot():
+    render_banner()
+    if st.button("← Home"):
+        go_home(); st.rerun()
+
+    st.markdown("## ⚽ Ask G-11")
+    st.markdown(
+        "*Your expert WC 2026 analyst. Ask about players, results, standings, or form — "
+        "all grounded in live tournament data.*"
+    )
+
+    if st.button("Clear chat", type="secondary"):
+        st.session_state.chat_messages = []
+        st.rerun()
+
+    for msg in st.session_state.chat_messages:
+        avatar = "⚽" if msg["role"] == "assistant" else None
+        with st.chat_message(msg["role"], avatar=avatar):
+            st.write(msg["content"])
+
+    if prompt := st.chat_input("Ask G-11 anything about WC 2026..."):
+        st.session_state.chat_messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.write(prompt)
+        with st.chat_message("assistant", avatar="⚽"):
+            with st.spinner("G-11 is analyzing..."):
+                reply = _ask_diego(prompt, st.session_state.chat_messages)
+            st.write(reply)
+        st.session_state.chat_messages.append({"role": "assistant", "content": reply})
+        st.rerun()
 
 # ── Banner ─────────────────────────────────────────────────────────────────────
 def render_banner():
@@ -1290,7 +1404,7 @@ def render_compare():
 def render_home():
     render_banner()
 
-    _c1, _c2, _c3, _ = st.columns([2, 2, 2, 2])
+    _c1, _c2, _c3, _c4 = st.columns([2, 2, 2, 2])
     with _c1:
         if st.button("📊 Standings & Leaderboards →", use_container_width=True):
             go_standings(); st.rerun()
@@ -1300,6 +1414,9 @@ def render_home():
     with _c3:
         if st.button("⚔️ Compare Players →", use_container_width=True):
             go_compare(); st.rerun()
+    with _c4:
+        if st.button("⚽ Ask G-11 →", use_container_width=True):
+            go_chatbot(); st.rerun()
     st.markdown("")
 
     query = st.text_input(
@@ -1709,6 +1826,7 @@ elif view == "country":   render_country()
 elif view == "standings": render_standings()
 elif view == "calendar":  render_calendar()
 elif view == "compare":   render_compare()
+elif view == "chatbot":   render_chatbot()
 
 # ── Footer ─────────────────────────────────────────────────────────────────────
 st.markdown(
