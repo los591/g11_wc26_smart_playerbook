@@ -1,5 +1,5 @@
 import json
-import os
+import os  # noqa
 import unicodedata
 import uuid
 from datetime import datetime, timezone
