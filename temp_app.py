@@ -7,6 +7,7 @@ from urllib.parse import quote, unquote
 from zoneinfo import ZoneInfo
 import streamlit as st
 from posthog import Posthog
+from google import genai as _genai
 
 st.set_page_config(
     page_title="FIFA World Cup 2026",
@@ -34,6 +35,82 @@ def track(event, **props):
         except Exception:
             pass
 
+# ── Diego Armando (AI Analyst) ─────────────────────────────────────────────────
+@st.cache_resource
+def _gemini_client():
+    key = st.secrets.get("GEMINI_API_KEY", "")
+    if not key:
+        return None
+    return _genai.Client(api_key=key)
+
+_DIEGO_SYSTEM = """You are G-11, a passionate and witty World Cup 2026 expert analyst.
+You ONLY answer questions based on the tournament data provided below — completed fixtures, player stats, and squad info.
+Do not speculate beyond the data. Be concise, insightful, and speak like someone who loves the game.
+If asked something not covered by the data, say you can only speak to what's happening at WC 2026.
+
+{context}
+
+=== CONVERSATION ===
+"""
+
+@st.cache_data(ttl=3600)
+def _build_context():
+    players = load_data()
+    fixtures = load_fixtures()
+    _PLAYED = {"FT", "AET", "PEN"}
+    lines = [
+        "FIFA World Cup 2026 | USA · Canada · Mexico | 48 teams, 104 fixtures, 1,248 players",
+        "",
+        "COMPLETED FIXTURES:",
+    ]
+    for f in sorted(fixtures, key=lambda x: x["date"]):
+        if f.get("status") in _PLAYED:
+            lines.append(
+                f"  {f['date']} | {f['round']} | "
+                f"{f['home_team']} {f['home_goals']}-{f['away_goals']} {f['away_team']}"
+            )
+    lines += ["", "ALL SQUAD PLAYERS (WC 2026):"]
+    for squad in players.values():
+        for p in squad:
+            agg = p.get("wc_aggregates")
+            if agg and agg.get("appearances", 0):
+                g = agg.get("goals", {})
+                lines.append(
+                    f"  {p['player']} | {p['country_for_app']} | {p['position']} | {p['club']} | "
+                    f"Apps:{agg['appearances']} Min:{agg['games']['minutes']} "
+                    f"Rating:{agg['games'].get('rating','N/A')} "
+                    f"Goals:{g.get('total',0)} Assists:{g.get('assists',0)} "
+                    f"Shots:{agg['shots']['total']} OnTarget:{agg['shots']['on']} "
+                    f"Passes:{agg['passes']['total']} PassAcc:{agg['passes']['accuracy']}% "
+                    f"Tackles:{agg['tackles']['total']} "
+                    f"Yellow:{agg['cards']['yellow']} Red:{agg['cards']['red']} "
+                    f"Saves:{g.get('saves',0)} Offsides:{agg.get('offsides',0)}"
+                )
+            else:
+                lines.append(
+                    f"  {p['player']} | {p['country_for_app']} | {p['position']} | {p['club']} | No WC appearances yet"
+                )
+    return "\n".join(lines)
+
+def _ask_diego(question, history):
+    client = _gemini_client()
+    if not client:
+        return "G-11 is unavailable — add GEMINI_API_KEY to .streamlit/secrets.toml to activate."
+    context = _build_context()
+    prompt = _DIEGO_SYSTEM.format(context=context)
+    for msg in history[:-1]:
+        role = "User" if msg["role"] == "user" else "G-11"
+        prompt += f"\n{role}: {msg['content']}"
+    prompt += f"\nUser: {question}\nG-11:"
+    try:
+        response = _gemini_client().models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
+        return response.text.strip()
+    except Exception as e:
+        return f"G-11 ran into an issue: {e}"
+
 # ── Session state ──────────────────────────────────────────────────────────────
 for key, default in [
     ("view", "home"),
@@ -44,6 +121,7 @@ for key, default in [
     ("compare_p2", None),
     ("calendar_tz", "UTC"),
     ("session_id", None),
+    ("chat_messages", []),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -616,6 +694,131 @@ def go_compare():
     st.session_state.view = "compare"
     st.session_state.selected_group = st.session_state.selected_country = None
     st.session_state.selected_player = 0
+
+def go_third_place():
+    track("page_viewed", view="third_place")
+    st.session_state.view = "third_place"
+    st.session_state.selected_group = st.session_state.selected_country = None
+    st.session_state.selected_player = 0
+
+def go_chatbot():
+    track("page_viewed", view="chatbot")
+    st.session_state.view = "chatbot"
+    st.session_state.selected_group = st.session_state.selected_country = None
+    st.session_state.selected_player = 0
+
+def render_third_place():
+    render_banner()
+
+    back_col, _ = st.columns([1, 9])
+    with back_col:
+        if st.button("← Home"):
+            go_home(); st.rerun()
+
+    st.markdown("<h2 style='margin:0.5rem 0 0.25rem 0'>🥉 Best Third-Place Rankings</h2>",
+                unsafe_allow_html=True)
+    st.caption(
+        "One third-place team per group (12 total). The top 8 by Pts → GD → GF advance to the Round of 16."
+    )
+    st.markdown("")
+
+    standings = compute_standings()
+
+    third_place = []
+    for g in GROUP_LETTERS:
+        group_teams = sorted(
+            [t for t in standings.values() if t["group"] == g],
+            key=lambda x: (-x["Pts"], -x["GD"], -x["GF"]),
+        )
+        if len(group_teams) >= 3:
+            third_place.append(group_teams[2])
+
+    if not third_place:
+        st.info("No group stage data yet — check back once matches are played.")
+        return
+
+    ranked = sorted(third_place, key=lambda x: (-x["Pts"], -x["GD"], -x["GF"]))
+
+    for i, team in enumerate(ranked):
+        advances = i < 8
+        flag     = COUNTRY_FLAGS.get(team["country"], "")
+        color    = GROUP_COLORS.get(team["group"], "#3B82F6")
+        gd       = team["GD"]
+        gd_str   = f"+{gd}" if gd > 0 else str(gd)
+        border   = "#22C55E" if advances else "#334155"
+        rank_col = "#22C55E" if advances else "#64748B"
+        adv_html = (
+            "<span style='color:#22C55E;font-size:11px;font-weight:700'>✓ Advances</span>"
+            if advances else
+            "<span style='color:#475569;font-size:11px'>Eliminated</span>"
+        )
+        st.markdown(
+            f"<div style='background:#1E293B;border-radius:10px;padding:10px 16px;"
+            f"margin-bottom:6px;border-left:4px solid {border};'>"
+            f"  <div style='display:flex;align-items:center;gap:12px;flex-wrap:wrap;'>"
+            f"    <div style='font-size:1.1rem;font-weight:900;color:{rank_col};min-width:28px'>#{i+1}</div>"
+            f"    <div style='flex:1;font-weight:700;color:white;font-size:14px'>{flag} {team['name']}</div>"
+            f"    <span style='font-size:11px;color:{color};background:#0F172A;"
+            f"          padding:2px 8px;border-radius:999px'>Group {team['group']}</span>"
+            f"    <div style='display:flex;gap:14px;font-size:12px;color:#CBD5E1;'>"
+            f"      <span>P <b style='color:white'>{team['P']}</b></span>"
+            f"      <span>Pts <b style='color:white'>{team['Pts']}</b></span>"
+            f"      <span>GD <b style='color:white'>{gd_str}</b></span>"
+            f"      <span>GF <b style='color:white'>{team['GF']}</b></span>"
+            f"      <span>GA <b style='color:white'>{team['GA']}</b></span>"
+            f"    </div>"
+            f"    {adv_html}"
+            f"  </div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+    if len(ranked) < 12:
+        st.caption(f"⏳ {12 - len(ranked)} group(s) not yet started — ranking will update as matches are played.")
+
+
+def render_chatbot():
+    render_banner()
+    if st.button("← Home"):
+        go_home(); st.rerun()
+
+    st.markdown("## ⚽ Ask G-11")
+    st.markdown(
+        "*Your expert WC 2026 analyst. Ask about players, results, standings, or form — "
+        "all grounded in live tournament data.*"
+    )
+
+    if st.button("Clear chat", type="secondary"):
+        st.session_state.chat_messages = []
+        st.rerun()
+
+    for msg in st.session_state.chat_messages:
+        avatar = "⚽" if msg["role"] == "assistant" else None
+        with st.chat_message(msg["role"], avatar=avatar):
+            st.write(msg["content"])
+
+    # Auto-answer when a question arrives pre-loaded from the home page
+    if st.session_state.chat_messages and st.session_state.chat_messages[-1]["role"] == "user":
+        with st.chat_message("assistant", avatar="⚽"):
+            with st.spinner("G-11 is analyzing..."):
+                reply = _ask_diego(
+                    st.session_state.chat_messages[-1]["content"],
+                    st.session_state.chat_messages,
+                )
+            st.write(reply)
+        st.session_state.chat_messages.append({"role": "assistant", "content": reply})
+        st.rerun()
+
+    if prompt := st.chat_input("Ask G-11 anything about WC 2026..."):
+        st.session_state.chat_messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.write(prompt)
+        with st.chat_message("assistant", avatar="⚽"):
+            with st.spinner("G-11 is analyzing..."):
+                reply = _ask_diego(prompt, st.session_state.chat_messages)
+            st.write(reply)
+        st.session_state.chat_messages.append({"role": "assistant", "content": reply})
+        st.rerun()
 
 # ── Banner ─────────────────────────────────────────────────────────────────────
 def render_banner():
@@ -1281,7 +1484,59 @@ def render_compare():
 def render_home():
     render_banner()
 
-    _c1, _c2, _c3, _ = st.columns([2, 2, 2, 2])
+    # ── G-11 Hero ──────────────────────────────────────────────────────────────
+    st.markdown("""
+    <div style="background:linear-gradient(135deg,#0f172a 0%,#0d2340 100%);
+                border:1px solid #1e40af; border-radius:14px;
+                padding:1.2rem 1.5rem 0.8rem; margin-bottom:0.75rem;
+                display:flex; align-items:center; gap:1.2rem;">
+      <div style="flex:1;">
+        <div style="font-size:1.05rem;font-weight:800;color:white;margin-bottom:3px;">⚽ Ask G-11</div>
+        <div style="font-size:0.8rem;color:#93C5FD;">
+          AI analyst grounded in live WC 2026 data — results, players &amp; stats updated hourly.
+        </div>
+      </div>
+      <img src="app/static/ciao.webp"
+           style="height:90px;object-fit:contain;flex-shrink:0;">
+    </div>
+    """, unsafe_allow_html=True)
+
+    sq1, sq2, sq3 = st.columns(3)
+    for col, q in zip(
+        [sq1, sq2, sq3],
+        [
+            "Who are the top scorers so far?",
+            "Which teams have won all their games?",
+            "Who has the best rating in the tournament?",
+        ],
+    ):
+        with col:
+            if st.button(q, use_container_width=True):
+                st.session_state.chat_messages = [{"role": "user", "content": q}]
+                go_chatbot()
+                st.rerun()
+
+    with st.form("g11_home_form", clear_on_submit=True, border=False):
+        fc1, fc2 = st.columns([5, 1])
+        with fc1:
+            home_q = st.text_input(
+                "home_q", placeholder="Or type your own question...",
+                label_visibility="collapsed",
+            )
+        with fc2:
+            home_submitted = st.form_submit_button("Ask →", use_container_width=True)
+    if home_submitted and home_q.strip():
+        st.session_state.chat_messages = [{"role": "user", "content": home_q.strip()}]
+        go_chatbot()
+        st.rerun()
+
+    st.markdown("")
+
+    # ── Secondary nav ──────────────────────────────────────────────────────────
+    _c0, _c1, _c2, _c3 = st.columns(4)
+    with _c0:
+        if st.button("🥉 Best Third Place →", use_container_width=True):
+            go_third_place(); st.rerun()
     with _c1:
         if st.button("📊 Standings & Leaderboards →", use_container_width=True):
             go_standings(); st.rerun()
@@ -1294,9 +1549,9 @@ def render_home():
     st.markdown("")
 
     query = st.text_input(
-        "🔍 Search for a player or club",
-        placeholder="e.g. Messi, Mbappé, Pedri, Real Madrid...",
-        label_visibility="collapsed",
+        "🔍 Search for a player or club — e.g. Mbappé, Messi, Pedri, Real Madrid...",
+        placeholder="Name or club...",
+        label_visibility="visible",
     )
     if query.strip():
         q = normalize(query.strip())
@@ -1699,7 +1954,9 @@ elif view == "group":     render_group()
 elif view == "country":   render_country()
 elif view == "standings": render_standings()
 elif view == "calendar":  render_calendar()
-elif view == "compare":   render_compare()
+elif view == "compare":      render_compare()
+elif view == "third_place":  render_third_place()
+elif view == "chatbot":      render_chatbot()
 
 # ── Footer ─────────────────────────────────────────────────────────────────────
 st.markdown(
