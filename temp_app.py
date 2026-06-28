@@ -86,6 +86,25 @@ def _build_context():
                     f"Yellow:{agg['cards']['yellow']} Red:{agg['cards']['red']} "
                     f"Saves:{g.get('saves',0)} Offsides:{agg.get('offsides',0)}"
                 )
+                for perf in sorted(
+                    p.get("wc_match_performances") or [],
+                    key=lambda x: x.get("date", ""),
+                ):
+                    pg  = perf.get("goals",   {}) or {}
+                    ps  = perf.get("shots",   {}) or {}
+                    pp  = perf.get("passes",  {}) or {}
+                    pt  = perf.get("tackles", {}) or {}
+                    pc  = perf.get("cards",   {}) or {}
+                    pga = perf.get("games",   {}) or {}
+                    acc = pp.get("accuracy")
+                    acc_str = f"{acc:.0f}%" if isinstance(acc, (int, float)) else "N/A"
+                    lines.append(
+                        f"    [{perf.get('date','?')} vs {perf.get('opponent','?')} | "
+                        f"Min:{pga.get('minutes',0)} Rating:{pga.get('rating','N/A')} "
+                        f"Goals:{pg.get('total',0)} Assists:{pg.get('assists',0)} "
+                        f"Shots:{ps.get('total',0)} Passes:{pp.get('total',0)} PassAcc:{acc_str} "
+                        f"Tackles:{pt.get('total',0)} Yellow:{pc.get('yellow',0)} Red:{pc.get('red',0)}]"
+                    )
             else:
                 lines.append(
                     f"  {p['player']} | {p['country_for_app']} | {p['position']} | {p['club']} | No WC appearances yet"
@@ -695,9 +714,9 @@ def go_compare():
     st.session_state.selected_group = st.session_state.selected_country = None
     st.session_state.selected_player = 0
 
-def go_third_place():
-    track("page_viewed", view="third_place")
-    st.session_state.view = "third_place"
+def go_browse_groups():
+    track("page_viewed", view="browse_groups")
+    st.session_state.view = "browse_groups"
     st.session_state.selected_group = st.session_state.selected_country = None
     st.session_state.selected_player = 0
 
@@ -707,7 +726,97 @@ def go_chatbot():
     st.session_state.selected_group = st.session_state.selected_country = None
     st.session_state.selected_player = 0
 
-def render_third_place():
+_KNOCKOUT_ROUND_ORDER = [
+    "Round of 16", "Quarter-finals", "Semi-finals", "3rd Place Play-off", "Final"
+]
+_KNOCKOUT_ROUND_COLORS = {
+    "Round of 16":       "#06B6D4",
+    "Quarter-finals":    "#3B82F6",
+    "Semi-finals":       "#8B5CF6",
+    "3rd Place Play-off":"#6B7280",
+    "Final":             "#F59E0B",
+}
+
+def _render_knockout_bracket():
+    knockout = [f for f in wc_fixtures if not (f.get("round") or "").startswith("Group Stage")]
+    if not knockout:
+        st.info("⏳ Bracket coming soon — check back once the group stage is complete.")
+        return
+
+    team_id_to_group = {
+        squad[0]["country_id"]: COUNTRY_GROUP.get(country, "?")
+        for country, squad in all_players.items()
+        if squad and squad[0].get("country_id")
+    }
+    team_id_to_country_key = {
+        squad[0]["country_id"]: country
+        for country, squad in all_players.items()
+        if squad and squad[0].get("country_id")
+    }
+
+    # ── Timezone selector ──────────────────────────────────────────────────────
+    tz_col, _ = st.columns([3, 5])
+    with tz_col:
+        tz_labels  = list(TIMEZONES.keys())
+        saved_tz   = st.session_state.get("calendar_tz", "UTC")
+        saved_idx  = tz_labels.index(saved_tz) if saved_tz in tz_labels else 0
+        sel_tz_label = st.selectbox(
+            "Timezone", tz_labels, index=saved_idx,
+            label_visibility="collapsed", key="bracket_tz_select",
+        )
+        st.session_state["calendar_tz"] = sel_tz_label
+    tz      = ZoneInfo(TIMEZONES[sel_tz_label])
+    tz_abbr = sel_tz_label.split("—")[0].strip()
+
+    def _enrich(f):
+        date_s = f.get("date", "")
+        time_s = f.get("time", "")
+        local_date, local_time = date_s, time_s
+        if date_s and time_s:
+            try:
+                utc_dt   = datetime.strptime(f"{date_s} {time_s}", "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+                local_dt = utc_dt.astimezone(tz)
+                local_date = local_dt.strftime("%Y-%m-%d")
+                local_time = local_dt.strftime("%H:%M")
+            except ValueError:
+                pass
+        return {
+            **f,
+            "_home_country_key": team_id_to_country_key.get(f.get("home_team_id")),
+            "_away_country_key": team_id_to_country_key.get(f.get("away_team_id")),
+            "_local_date": local_date,
+            "_local_time": local_time,
+            "_tz_abbr":    tz_abbr,
+        }
+
+    by_round: dict[str, list] = {}
+    for f in knockout:
+        by_round.setdefault(f.get("round", "Unknown"), []).append(f)
+
+    round_order = [r for r in _KNOCKOUT_ROUND_ORDER if r in by_round]
+    for r in by_round:
+        if r not in round_order:
+            round_order.append(r)
+
+    for round_name in round_order:
+        fixtures = sorted(by_round[round_name], key=lambda x: x.get("date", ""))
+        color = _KNOCKOUT_ROUND_COLORS.get(round_name, "#94A3B8")
+        st.markdown(
+            f"<div style='font-size:0.75rem;font-weight:700;letter-spacing:2px;color:{color};"
+            f"text-transform:uppercase;margin:1.2rem 0 0.4rem 0'>{round_name}</div>",
+            unsafe_allow_html=True,
+        )
+        if len(fixtures) >= 4:
+            col_a, col_b = st.columns(2, gap="medium")
+            for i, fixture in enumerate(fixtures):
+                with (col_a if i % 2 == 0 else col_b):
+                    _render_match_card(_enrich(fixture), team_id_to_group, show_date=True)
+        else:
+            for fixture in fixtures:
+                _render_match_card(_enrich(fixture), team_id_to_group, show_date=True)
+
+
+def render_browse_groups():
     render_banner()
 
     back_col, _ = st.columns([1, 9])
@@ -715,66 +824,24 @@ def render_third_place():
         if st.button("← Home"):
             go_home(); st.rerun()
 
-    st.markdown("<h2 style='margin:0.5rem 0 0.25rem 0'>🥉 Best Third-Place Rankings</h2>",
+    st.markdown("<h2 style='margin:0.5rem 0 1rem 0'>🌍 Browse Groups</h2>",
                 unsafe_allow_html=True)
-    st.caption(
-        "One third-place team per group (12 total). The top 8 by Pts → GD → GF advance to the Round of 16."
-    )
-    st.markdown("")
 
-    standings = compute_standings()
-
-    third_place = []
-    for g in GROUP_LETTERS:
-        group_teams = sorted(
-            [t for t in standings.values() if t["group"] == g],
-            key=lambda x: (-x["Pts"], -x["GD"], -x["GF"]),
-        )
-        if len(group_teams) >= 3:
-            third_place.append(group_teams[2])
-
-    if not third_place:
-        st.info("No group stage data yet — check back once matches are played.")
-        return
-
-    ranked = sorted(third_place, key=lambda x: (-x["Pts"], -x["GD"], -x["GF"]))
-
-    for i, team in enumerate(ranked):
-        advances = i < 8
-        flag     = COUNTRY_FLAGS.get(team["country"], "")
-        color    = GROUP_COLORS.get(team["group"], "#3B82F6")
-        gd       = team["GD"]
-        gd_str   = f"+{gd}" if gd > 0 else str(gd)
-        border   = "#22C55E" if advances else "#334155"
-        rank_col = "#22C55E" if advances else "#64748B"
-        adv_html = (
-            "<span style='color:#22C55E;font-size:11px;font-weight:700'>✓ Advances</span>"
-            if advances else
-            "<span style='color:#475569;font-size:11px'>Eliminated</span>"
-        )
-        st.markdown(
-            f"<div style='background:#1E293B;border-radius:10px;padding:10px 16px;"
-            f"margin-bottom:6px;border-left:4px solid {border};'>"
-            f"  <div style='display:flex;align-items:center;gap:12px;flex-wrap:wrap;'>"
-            f"    <div style='font-size:1.1rem;font-weight:900;color:{rank_col};min-width:28px'>#{i+1}</div>"
-            f"    <div style='flex:1;font-weight:700;color:white;font-size:14px'>{flag} {team['name']}</div>"
-            f"    <span style='font-size:11px;color:{color};background:#0F172A;"
-            f"          padding:2px 8px;border-radius:999px'>Group {team['group']}</span>"
-            f"    <div style='display:flex;gap:14px;font-size:12px;color:#CBD5E1;'>"
-            f"      <span>P <b style='color:white'>{team['P']}</b></span>"
-            f"      <span>Pts <b style='color:white'>{team['Pts']}</b></span>"
-            f"      <span>GD <b style='color:white'>{gd_str}</b></span>"
-            f"      <span>GF <b style='color:white'>{team['GF']}</b></span>"
-            f"      <span>GA <b style='color:white'>{team['GA']}</b></span>"
-            f"    </div>"
-            f"    {adv_html}"
-            f"  </div>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-
-    if len(ranked) < 12:
-        st.caption(f"⏳ {12 - len(ranked)} group(s) not yet started — ranking will update as matches are played.")
+    for row_start in range(0, 12, 4):
+        cols = st.columns(4, gap="small")
+        for ci, group in enumerate(GROUP_LETTERS[row_start:row_start + 4]):
+            color = GROUP_COLORS[group]
+            with cols[ci]:
+                st.markdown(
+                    f"<div class='group-card' style='--g-color:{color}'>"
+                    f"<div class='group-label'>Group {group}</div>"
+                    f"<div class='group-countries'>"
+                    + "".join(f"<div>{COUNTRY_DISPLAY.get(c, c)}</div>" for c in GROUPS[group])
+                    + "</div></div>",
+                    unsafe_allow_html=True,
+                )
+                if st.button(f"Group {group}", key=f"bg_grp_{group}"):
+                    go_group(group); st.rerun()
 
 
 def render_chatbot():
@@ -934,7 +1001,7 @@ def render_standings():
     st.markdown("<h2 style='margin:0.5rem 0 1rem 0'>📊 Standings & Leaderboards</h2>",
                 unsafe_allow_html=True)
 
-    tab_st, tab_lb = st.tabs(["📊 Group Standings", "🏆 Leaderboards"])
+    tab_st, tab_lb, tab_tp = st.tabs(["📊 Group Standings", "🏆 Leaderboards", "🥉 Best Third Place"])
 
     with tab_st:
         standings = compute_standings()
@@ -1019,6 +1086,60 @@ def render_standings():
             gks = [r for r in lb if r["position"] == "Goalkeeper"]
             _lb_section(sorted(gks, key=lambda x: -x["saves"]), "saves", "Saves")
 
+    with tab_tp:
+        st.caption(
+            "One third-place team per group (12 total). The top 8 by Pts → GD → GF advance to the Round of 16."
+        )
+        st.markdown("")
+        tp_standings = compute_standings()
+        third_place = []
+        for g in GROUP_LETTERS:
+            group_teams = sorted(
+                [t for t in tp_standings.values() if t["group"] == g],
+                key=lambda x: (-x["Pts"], -x["GD"], -x["GF"]),
+            )
+            if len(group_teams) >= 3:
+                third_place.append(group_teams[2])
+        if not third_place:
+            st.info("No group stage data yet — check back once matches are played.")
+        else:
+            ranked = sorted(third_place, key=lambda x: (-x["Pts"], -x["GD"], -x["GF"]))
+            for i, team in enumerate(ranked):
+                advances = i < 8
+                flag     = COUNTRY_FLAGS.get(team["country"], "")
+                color    = GROUP_COLORS.get(team["group"], "#3B82F6")
+                gd       = team["GD"]
+                gd_str   = f"+{gd}" if gd > 0 else str(gd)
+                border   = "#22C55E" if advances else "#334155"
+                rank_col = "#22C55E" if advances else "#64748B"
+                adv_html = (
+                    "<span style='color:#22C55E;font-size:11px;font-weight:700'>✓ Advances</span>"
+                    if advances else
+                    "<span style='color:#475569;font-size:11px'>Eliminated</span>"
+                )
+                st.markdown(
+                    f"<div style='background:#1E293B;border-radius:10px;padding:10px 16px;"
+                    f"margin-bottom:6px;border-left:4px solid {border};'>"
+                    f"  <div style='display:flex;align-items:center;gap:12px;flex-wrap:wrap;'>"
+                    f"    <div style='font-size:1.1rem;font-weight:900;color:{rank_col};min-width:28px'>#{i+1}</div>"
+                    f"    <div style='flex:1;font-weight:700;color:white;font-size:14px'>{flag} {team['name']}</div>"
+                    f"    <span style='font-size:11px;color:{color};background:#0F172A;"
+                    f"          padding:2px 8px;border-radius:999px'>Group {team['group']}</span>"
+                    f"    <div style='display:flex;gap:14px;font-size:12px;color:#CBD5E1;'>"
+                    f"      <span>P <b style='color:white'>{team['P']}</b></span>"
+                    f"      <span>Pts <b style='color:white'>{team['Pts']}</b></span>"
+                    f"      <span>GD <b style='color:white'>{gd_str}</b></span>"
+                    f"      <span>GF <b style='color:white'>{team['GF']}</b></span>"
+                    f"      <span>GA <b style='color:white'>{team['GA']}</b></span>"
+                    f"    </div>"
+                    f"    {adv_html}"
+                    f"  </div>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+            if len(ranked) < 12:
+                st.caption(f"⏳ {12 - len(ranked)} group(s) still to finish.")
+
 
 # ── Match card helper ──────────────────────────────────────────────────────────
 _PLAYED = {"FT", "AET", "PEN"}
@@ -1043,7 +1164,7 @@ TIMEZONES = {
     "AEST— Sydney / Melbourne":      "Australia/Sydney",
 }
 
-def _render_match_card(fixture, team_id_to_group):
+def _render_match_card(fixture, team_id_to_group, show_date=False):
     played    = fixture["status"] in _PLAYED
     group     = team_id_to_group.get(fixture["home_team_id"], "?")
     color     = GROUP_COLORS.get(group, "#3B82F6")
@@ -1079,17 +1200,39 @@ def _render_match_card(fixture, team_id_to_group):
             h_style, a_style = "color:#64748B", "font-weight:900;color:white"
         else:
             h_style = a_style = "font-weight:700;color:white"
+        date_suffix = ""
+        if show_date:
+            _date_str = fixture.get("_local_date") or fixture.get("date", "")
+            if _date_str:
+                try:
+                    _d = datetime.strptime(_date_str, "%Y-%m-%d")
+                    date_suffix = f" · {_d.strftime('%b')} {_d.day}"
+                except ValueError:
+                    pass
         mid_html = (
             f"<span style='font-size:1.25rem;font-weight:900;color:white'>{hg} – {ag}</span><br>"
-            f"<span style='font-size:10px;color:#64748B;letter-spacing:1px'>{fixture['status']}</span>"
+            f"<span style='font-size:10px;color:#64748B;letter-spacing:1px'>{fixture['status']}{date_suffix}</span>"
         )
     else:
         h_style = a_style = "color:#94A3B8"
         time_str = fixture.get("_local_time") or fixture.get("time", "")
         tz_label = fixture.get("_tz_abbr", "UTC")
+        date_html = ""
+        if show_date:
+            _date_str = fixture.get("_local_date") or fixture.get("date", "")
+            if _date_str:
+                try:
+                    _d = datetime.strptime(_date_str, "%Y-%m-%d")
+                    date_html = (
+                        f"<span style='font-size:11px;color:#CBD5E1;font-weight:700'>"
+                        f"{_d.strftime('%b')} {_d.day}</span><br>"
+                    )
+                except ValueError:
+                    pass
         mid_html = (
+            f"{date_html}"
             f"<span style='font-size:0.95rem;color:#475569;font-weight:600'>vs</span><br>"
-            + (f"<span style='font-size:10px;color:#64748B'>{time_str} {tz_label}</span>" if time_str else "")
+            + (f"<span style='font-size:10px;color:#94A3B8'>{time_str} {tz_label}</span>" if time_str else "")
         )
 
     round_label = fixture.get("round", "")
@@ -1505,9 +1648,9 @@ def render_home():
     for col, q in zip(
         [sq1, sq2, sq3],
         [
-            "Who are the top scorers so far?",
-            "Which teams have won all their games?",
-            "Who has the best rating in the tournament?",
+            "How many passes has Caicedo completed at this World Cup?",
+            "Which defender has the most tackles so far?",
+            "Who has the best pass accuracy among midfielders?",
         ],
     ):
         with col:
@@ -1535,8 +1678,8 @@ def render_home():
     # ── Secondary nav ──────────────────────────────────────────────────────────
     _c0, _c1, _c2, _c3 = st.columns(4)
     with _c0:
-        if st.button("🥉 Best Third Place →", use_container_width=True):
-            go_third_place(); st.rerun()
+        if st.button("🌍 Browse Groups →", use_container_width=True):
+            go_browse_groups(); st.rerun()
     with _c1:
         if st.button("📊 Standings & Leaderboards →", use_container_width=True):
             go_standings(); st.rerun()
@@ -1597,22 +1740,9 @@ def render_home():
                 st.caption(f"Showing first 25 of {len(results)} results — refine your search to narrow down.")
         st.divider()
 
-    st.markdown("#### Select a Group")
-    for row_start in range(0, 12, 4):
-        cols = st.columns(4, gap="small")
-        for ci, group in enumerate(GROUP_LETTERS[row_start:row_start + 4]):
-            color = GROUP_COLORS[group]
-            with cols[ci]:
-                st.markdown(
-                    f"<div class='group-card' style='--g-color:{color}'>"
-                    f"<div class='group-label'>Group {group}</div>"
-                    f"<div class='group-countries'>"
-                    + "".join(f"<div>{COUNTRY_DISPLAY.get(c, c)}</div>" for c in GROUPS[group])
-                    + "</div></div>",
-                    unsafe_allow_html=True,
-                )
-                if st.button(f"Group {group}", key=f"grp_{group}"):
-                    go_group(group); st.rerun()
+    st.markdown("<h3 style='margin:0.5rem 0 0.25rem 0'>🏆 Knockout Stage</h3>",
+                unsafe_allow_html=True)
+    _render_knockout_bracket()
 
 # ── VIEW: GROUP ────────────────────────────────────────────────────────────────
 def render_group():
@@ -1954,9 +2084,9 @@ elif view == "group":     render_group()
 elif view == "country":   render_country()
 elif view == "standings": render_standings()
 elif view == "calendar":  render_calendar()
-elif view == "compare":      render_compare()
-elif view == "third_place":  render_third_place()
-elif view == "chatbot":      render_chatbot()
+elif view == "compare":       render_compare()
+elif view == "browse_groups": render_browse_groups()
+elif view == "chatbot":       render_chatbot()
 
 # ── Footer ─────────────────────────────────────────────────────────────────────
 st.markdown(
