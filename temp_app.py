@@ -727,7 +727,7 @@ def go_chatbot():
     st.session_state.selected_player = 0
 
 _KNOCKOUT_ROUND_ORDER = [
-    "Round of 16", "Quarter-finals", "Semi-finals", "3rd Place Play-off", "Final"
+    "Final", "3rd Place Play-off", "Semi-finals", "Quarter-finals", "Round of 16", "Round of 32"
 ]
 _KNOCKOUT_ROUND_COLORS = {
     "Round of 16":       "#06B6D4",
