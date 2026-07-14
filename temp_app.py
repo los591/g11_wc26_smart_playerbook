@@ -1182,11 +1182,15 @@ def _render_match_card(fixture, team_id_to_group, show_date=False):
     if away_key:
         away_name = f"<a href='?country={quote(away_key)}' target='_self' style='{link_style}'>{away_name}</a>"
 
+    home_flag = COUNTRY_FLAGS.get(home_key, "")
+    away_flag = COUNTRY_FLAGS.get(away_key, "")
     home_img = (
+        f"<span style='font-size:22px'>{home_flag}</span>" if home_flag else
         f"<img src='{home_logo}' style='width:28px;height:28px;object-fit:contain;vertical-align:middle'>"
         if home_logo else "🏟️"
     )
     away_img = (
+        f"<span style='font-size:22px'>{away_flag}</span>" if away_flag else
         f"<img src='{away_logo}' style='width:28px;height:28px;object-fit:contain;vertical-align:middle'>"
         if away_logo else "🏟️"
     )
